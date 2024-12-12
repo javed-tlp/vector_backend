@@ -23,64 +23,61 @@ async def authorize_hubspot(user_id, org_id):
     }
     encoded_state = base64.urlsafe_b64encode(json.dumps(state_data).encode('utf-8')).decode('utf-8')
 
-    # Set the required scope, for example, to access contacts
-    scope = 'contacts.read deals.read'  # Update this with the actual scope you need
+    # Temporarily change scope to crm.objects.deals.read
+    scope = 'crm.objects.deals.read'
 
-    # Generate the HubSpot authorization URL with the correct scope
+    # Generate HubSpot authorization URL with new scope
     auth_url = f"https://app.hubspot.com/oauth/authorize?client_id={CLIENT_ID}&response_type=code&redirect_uri={REDIRECT_URI}&scope={scope}&state={encoded_state}"
     
     # Store the state for later validation
     await add_key_value_redis(f'hubspot_state:{org_id}:{user_id}', encoded_state, expire=600)
+    print(f"Generated HubSpot Authorization URL: {auth_url}")  # Debug log
 
-    return auth_url
-
-    # Generate a random state value for OAuth security
-    state_data = {
-        'state': secrets.token_urlsafe(32),
-        'user_id': user_id,
-        'org_id': org_id
-    }
-    encoded_state = base64.urlsafe_b64encode(json.dumps(state_data).encode('utf-8')).decode('utf-8')
-    
-    # Store the state for later validation in Redis
-    await add_key_value_redis(f'hubspot_state:{org_id}:{user_id}', encoded_state, expire=600)
-
-    # Return the HubSpot OAuth URL with the state parameter
-    auth_url = f"{authorization_url}&state={encoded_state}"
     return auth_url
 
 async def oauth2callback_hubspot(request: Request):
     # Retrieve the authorization code and state from the query parameters
     code = request.query_params.get('code')
     encoded_state = request.query_params.get('state')
+
+    # Ensure that code and state are provided
+    if not code or not encoded_state:
+        raise HTTPException(status_code=400, detail="Missing code or state")
+
+    # Decode and validate the state
     state_data = json.loads(base64.urlsafe_b64decode(encoded_state).decode('utf-8'))
 
+    # Fetch stored state from Redis
     user_id = state_data.get('user_id')
     org_id = state_data.get('org_id')
-
-    # Validate the state stored in Redis
     saved_state = await get_value_redis(f'hubspot_state:{org_id}:{user_id}')
-    if not saved_state or state_data.get('state') != json.loads(saved_state).get('state'):
-        raise HTTPException(status_code=400, detail='State does not match.')
 
-    # Exchange the authorization code for access tokens
+    # Check if the state matches
+    if not saved_state or state_data.get('state') != json.loads(saved_state).get('state'):
+        raise HTTPException(status_code=400, detail="State does not match.")
+
+    # Exchange the authorization code for an access token
     async with httpx.AsyncClient() as client:
         response = await client.post(
             'https://api.hubapi.com/oauth/v1/token',
             data={
                 'grant_type': 'authorization_code',
                 'code': code,
-                'redirect_uri': REDIRECT_URI,
-                'client_id': CLIENT_ID,
-                'client_secret': CLIENT_SECRET,
+                'redirect_uri': REDIRECT_URI,  # Use your redirect URI
+                'client_id': CLIENT_ID,        # Your HubSpot Client ID
+                'client_secret': CLIENT_SECRET,  # Your HubSpot Client Secret
             }
         )
+
+        if response.status_code != 200:
+            raise HTTPException(status_code=500, detail=f"Failed to exchange code: {response.text}")
+
         token_data = response.json()
 
-    # Store the access token and refresh token in Redis
-    await add_key_value_redis(f'hubspot_credentials:{org_id}:{user_id}', json.dumps(token_data), expire=600)
+        # Save the credentials in Redis (or your DB)
+        await add_key_value_redis(f'hubspot_credentials:{org_id}:{user_id}', json.dumps(token_data), expire=600)
 
-    # Close the OAuth window after success
+    # Optionally close the OAuth window
     close_window_script = """
     <html>
         <script>
@@ -94,9 +91,12 @@ async def oauth2callback_hubspot(request: Request):
 async def get_hubspot_credentials(user_id, org_id):
     credentials = await get_value_redis(f'hubspot_credentials:{org_id}:{user_id}')
     if not credentials:
+        print(f"No credentials found for {user_id} in {org_id}")  # Debug log
         raise HTTPException(status_code=400, detail='No credentials found.')
+    
     credentials = json.loads(credentials)
     await delete_key_redis(f'hubspot_credentials:{org_id}:{user_id}')
+    print(f"Retrieved credentials: {credentials}")  # Debug log
     return credentials
 
 # Helper function to create an IntegrationItem metadata object
@@ -115,10 +115,18 @@ async def get_items_hubspot(credentials: dict) -> list:
     access_token = credentials.get("access_token")
     url = 'https://api.hubapi.com/crm/v3/objects/contacts'  # Example API endpoint for contacts
 
+    print(f"Fetching items from HubSpot with token: {access_token}")  # Debug log
+
     async with httpx.AsyncClient() as client:
-        response = await client.get(url, headers={'Authorization': f'Bearer {access_token}'})
-    
-    items = response.json().get('results', [])
+        try:
+            response = await client.get(url, headers={'Authorization': f'Bearer {access_token}'})
+            response.raise_for_status()  # Will raise an error for 4xx/5xx responses
+            items = response.json().get('results', [])
+            print(f"Received items: {items}")  # Debug log
+        except httpx.RequestError as e:
+            print(f"Error fetching items: {e}")  # Debug log
+            raise HTTPException(status_code=500, detail="Failed to fetch HubSpot items")
+
     integration_items = []
 
     for item in items:
